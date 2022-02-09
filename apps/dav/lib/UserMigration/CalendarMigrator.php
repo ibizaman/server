@@ -47,8 +47,8 @@ use Sabre\DAV\Exception\BadRequest;
 use Sabre\DAV\Version as SabreDavVersion;
 use Sabre\VObject\Component as VObjectComponent;
 use Sabre\VObject\Component\VCalendar;
+use Sabre\VObject\Component\VEvent;
 use Sabre\VObject\Component\VTimeZone;
-use Sabre\VObject\Property as VObjectProperty;
 use Sabre\VObject\Property\ICalendar\DateTime;
 use Sabre\VObject\Reader as VObjectReader;
 use Sabre\VObject\UUIDUtil;
@@ -201,6 +201,27 @@ class CalendarMigrator {
 		return $calendarUri;
 	}
 
+	public function getCalendarComponentWithTimezones(VObjectComponent $component, array $calendarTimezoneMap): VObjectComponent {
+		$componentClone = clone $component;
+
+		// Construct array of required timezones for component
+		$componentTimezoneIds = [];
+		foreach ($componentClone->children() as $child) {
+			if ($child instanceof DateTime && $child->parameters()['TZID']) {
+				if (!in_array($child->parameters()['TZID']->getValue(), $componentTimezoneIds, true)) {
+					$componentTimezoneIds[] = $child->parameters()['TZID']->getValue();
+				}
+			}
+		}
+
+		// Add timezones to component
+		foreach ($componentTimezoneIds as $timezoneId) {
+			$componentClone->add($calendarTimezoneMap[$timezoneId]);
+		}
+
+		return $componentClone;
+	}
+
 	/**
 	 * @throws CalendarMigratorException
 	 */
@@ -229,44 +250,66 @@ class CalendarMigrator {
 			),
 		]);
 
-		$calendarTimezones = array_reduce(
+		/** @var VTimeZone[] $calendarTimezones */
+		$calendarTimezones = array_filter(
 			$vCalendar->getComponents(),
-			/**
-			 * @var VTimeZone[] $carryTimezones
-			 * @var VObjectProperty|VObjectComponent $child
-			 */
-			fn ($carryTimezones, $child) => $child->name === 'VTIMEZONE' ? [...$carryTimezones, $child] : $carryTimezones,
-			[],
+			fn ($component) => $component->name === 'VTIMEZONE',
 		);
 
+		/** @var array{tzid: VTimeZone} $calendarTimezoneMap */
 		$calendarTimezoneMap = [];
 		foreach ($calendarTimezones as $vTimeZone) {
 			$calendarTimezoneMap[$vTimeZone->TZID->getValue()] = $vTimeZone;
 		}
 
-		// Add data to the created calendar e.g. VEVENT, VTODO
-		foreach ($vCalendar->getBaseComponents() as $component) {
-			// TODO add more data based on https://github.com/nextcloud/calendar-js/blob/main/src/parsers/icalendarParser.js#L187
-			// TODO add attendee data
+		$calendarEvents = array_values(array_filter(
+			$vCalendar->getComponents(),
+			// TODO test with other component types e.g. VTODO, VALARM
+			fn ($component) => $component->name === 'VEVENT',
+		));
 
+		/** @var array{uid: VEvent|VEvent[]} $calendarEventMap */
+		$calendarEventMap = [];
+		foreach ($calendarEvents as $vEvent) {
+			$uid = $vEvent->UID->getValue();
+
+			// If uid is a duplicate then this is a recurring event
+			if (isset($calendarEventMap[$uid])) {
+				if (is_array($calendarEventMap[$uid])) {
+					$calendarEventMap[$uid][] = $vEvent;
+				} else {
+					// Set value to an array containing both the existing and new event
+					$calendarEventMap[$uid] = [$calendarEventMap[$uid], $vEvent];
+				}
+			} else {
+				$calendarEventMap[$uid] = $vEvent;
+			}
+		}
+
+		// Add data to the created calendar e.g. VEVENT, VTODO
+		foreach ($calendarEventMap as $uid => $value) {
 			$vCalendarObject = new VCalendar();
 			$vCalendarObject->PRODID = $this->sabreDavServer::$exposeVersion ? '-//SabreDAV//SabreDAV ' . SabreDavVersion::VERSION . '//EN' : '-//SabreDAV//SabreDAV//EN';
 
-			// Add timezones
-			$componentTimezoneIds = [];
-			foreach ($component->children() as $child) {
-				if ($child instanceof DateTime && $child->parameters()['TZID']) {
-					if (!in_array($child->parameters()['TZID']->getValue(), $componentTimezoneIds, true)) {
-						$componentTimezoneIds[] = $child->parameters()['TZID']->getValue();
-					}
+			// TODO Fix discrepancies between imported and exported data
+			// ref: https://github.com/nextcloud/calendar-js/blob/main/src/parsers/icalendarParser.js#L187
+
+			if (is_array($value)) {
+				// The base component of a recurring event does not contain the attendee information
+				// Recurring events have the same UID, the original event has an RRULE, the children have RECURRENCE-ID
+
+				// Merge components with the same UID into a single calendar object
+				/** @var VObjectComponent[] $value */
+				foreach ($value as $component) {
+					$componentWithTz = $this->getCalendarComponentWithTimezones($component, $calendarTimezoneMap);
+					$vCalendarObject->add($componentWithTz);
 				}
+			} else {
+				/** @var VObjectComponent $value */
+				$component = $value;
+				$componentWithTz = $this->getCalendarComponentWithTimezones($component, $calendarTimezoneMap);
+				$vCalendarObject->add($componentWithTz);
 			}
-
-			foreach ($componentTimezoneIds as $timezoneId) {
-				$component->add($calendarTimezoneMap[$timezoneId]);
-			}
-
-			$vCalendarObject->add($component);
 
 			try {
 				$this->calDavBackend->createCalendarObject(
