@@ -37,6 +37,7 @@ use OCA\DAV\Connector\Sabre\Server as SabreDavServer;
 use OCA\DAV\RootCollection;
 use OCP\Calendar\ICalendar;
 use OCP\Calendar\IManager as ICalendarManager;
+use OCP\Defaults;
 use OCP\IL10N;
 use OCP\IUser;
 use Psr\Log\LoggerInterface;
@@ -44,7 +45,6 @@ use Sabre\DAV\Exception\BadRequest;
 use Sabre\DAV\Version as SabreDavVersion;
 use Sabre\VObject\Component as VObjectComponent;
 use Sabre\VObject\Component\VCalendar;
-use Sabre\VObject\Component\VEvent;
 use Sabre\VObject\Component\VTimeZone;
 use Sabre\VObject\Property\ICalendar\DateTime;
 use Sabre\VObject\Reader as VObjectReader;
@@ -61,6 +61,8 @@ class CalendarMigrator {
 	// ICSExportPlugin is injected to use the mergeObjects() method and is not to be used as a SabreDAV server plugin
 	private ICSExportPlugin $icsExportPlugin;
 
+	private Defaults $defaults;
+
 	private LoggerInterface $logger;
 
 	private IL10N $l10n;
@@ -72,15 +74,17 @@ class CalendarMigrator {
 	public const FILENAME_EXT = '.ics';
 
 	public function __construct(
-		ICalendarManager $calendarManager,
 		CalDavBackend $calDavBackend,
+		ICalendarManager $calendarManager,
 		ICSExportPlugin $icsExportPlugin,
+		Defaults $defaults,
 		LoggerInterface $logger,
 		IL10N $l10n
 	) {
-		$this->calendarManager = $calendarManager;
 		$this->calDavBackend = $calDavBackend;
+		$this->calendarManager = $calendarManager;
 		$this->icsExportPlugin = $icsExportPlugin;
+		$this->defaults = $defaults;
 		$this->logger = $logger;
 		$this->l10n = $l10n;
 
@@ -89,23 +93,26 @@ class CalendarMigrator {
 		$this->sabreDavServer->addPlugin(new CalDAVPlugin());
 	}
 
+	public function getPrincipalUri(IUser $user): string {
+		return CalendarMigrator::USERS_URI_ROOT . $user->getUID();
+	}
+
 	/**
 	 * @return array<int, array{name: string, data: string}>
 	 *
 	 * @throws CalendarMigratorException
 	 */
 	public function getCalendarExports(IUser $user): array {
-		$userId = $user->getUID();
-		$principalUri = CalendarMigrator::USERS_URI_ROOT . $userId;
+		$principalUri = $this->getPrincipalUri($user);
 
 		return array_values(array_filter(array_map(
-			function (ICalendar $calendar) use ($userId) {
+			function (ICalendar $calendar) use ($user) {
 				try {
-					return $this->getCalendarExportData($userId, $calendar);
+					return $this->getCalendarExportData($user, $calendar);
 				} catch (CalendarMigratorException $e) {
 					throw new CalendarMigratorException();
 				} catch (InvalidCalendarException $e) {
-					// Invalid (e.g. deleted) calendars are not to be exported
+					// Allow this exception as invalid (e.g. deleted) calendars are not to be exported
 				}
 			},
 			$this->calendarManager->getCalendarsForPrincipal($principalUri),
@@ -118,7 +125,8 @@ class CalendarMigrator {
 	 * @throws CalendarMigratorException
 	 * @throws InvalidCalendarException
 	 */
-	public function getCalendarExportData(string $userId, ICalendar $calendar): array {
+	public function getCalendarExportData(IUser $user, ICalendar $calendar): array {
+		$userId = $user->getUID();
 		$calendarId = $calendar->getKey();
 		$calendarInfo = $this->calDavBackend->getCalendarById($calendarId);
 
@@ -153,7 +161,6 @@ class CalendarMigrator {
 					$blobs[$node['href']] = $node[200][$calDataProp];
 				}
 			}
-			unset($nodes);
 
 			$mergedCalendar = $this->icsExportPlugin->mergeObjects(
 				$properties,
@@ -169,21 +176,16 @@ class CalendarMigrator {
 		throw new CalendarMigratorException();
 	}
 
-
-	/**
-	 * Generate a non-conflicting uri by suffixing the initial uri for a principal,
-	 * if it does not conflict then the original initial uri is returned
-	 */
-	public function generateCalendarUri(IUser $user, string $initialCalendarUri): string {
-		$userId = $user->getUID();
-		$principalUri = CalendarMigrator::USERS_URI_ROOT . $userId;
-		$calendarUri = $initialCalendarUri;
+	public function getUniqueCalendarUri(IUser $user, string $initialCalendarUri): string {
+		$principalUri = $this->getPrincipalUri($user);
+		$initialCalendarUri = "migrated-$initialCalendarUri";
 
 		$existingCalendarUris = array_map(
 			fn (ICalendar $calendar) => $calendar->getUri(),
 			$this->calendarManager->getCalendarsForPrincipal($principalUri),
 		);
 
+		$calendarUri = $initialCalendarUri;
 		$acc = 1;
 		while (in_array($calendarUri, $existingCalendarUris, true)) {
 			$calendarUri = $initialCalendarUri . "-$acc";
@@ -191,184 +193,6 @@ class CalendarMigrator {
 		}
 
 		return $calendarUri;
-	}
-
-	/**
-	 * Return an associative array mapping of Time Zone ID to VTimeZone component
-	 *
-	 * @return array<string, VTimeZone>
-	 */
-	public function getCalendarTimezones(VCalendar $vCalendar): array {
-		/** @var VTimeZone[] $calendarTimezones */
-		$calendarTimezones = array_filter(
-			$vCalendar->getComponents(),
-			fn ($component) => $component->name === 'VTIMEZONE',
-		);
-
-		/** @var array<string, VTimeZone> $calendarTimezoneMap */
-		$calendarTimezoneMap = [];
-		foreach ($calendarTimezones as $vTimeZone) {
-			$calendarTimezoneMap[$vTimeZone->getTimeZone()->getName()] = $vTimeZone;
-		}
-
-		return array_reduce(
-			$calendarTimezones,
-			fn (array $timezoneMap, VTimeZone $vTimeZone) => array_merge($timezoneMap, [$vTimeZone->getTimeZone()->getName() => $vTimeZone]),
-			[],
-		);
-	}
-
-
-	/**
-	 * @param array<string, VTimeZone> $calendarTimezoneMap
-	 *
-	 * @return VTimeZone[]
-	 */
-	public function getComponentTimezones(VCalendar $vCalendar, VObjectComponent $component): array {
-		$componentTimezoneIds = [];
-		foreach ($component->children() as $child) {
-			if ($child instanceof DateTime && isset($child->parameters['TZID'])) {
-				if (!in_array($child->parameters['TZID']->getValue(), $componentTimezoneIds, true)) {
-					$componentTimezoneIds[] = $child->parameters['TZID']->getValue();
-				}
-			}
-		}
-
-		$calendarTimezoneMap = $this->getCalendarTimezones($vCalendar);
-
-		return array_map(
-			fn (string $timezoneId) => $calendarTimezoneMap[$timezoneId],
-			$componentTimezoneIds,
-		);
-	}
-
-	public function getCleanComponent(VObjectComponent $component): VObjectComponent {
-		$componentClone = clone $component;
-
-		// Remove RSVP parameters to prevent automatically sending invitaton emails to attendees on import of this component
-		foreach ($componentClone->children() as $child) {
-			if (
-				$child->name === 'ATTENDEE'
-				&& isset($child->parameters['RSVP'])
-			) {
-				unset($child->parameters['RSVP']);
-			}
-		}
-
-		return $componentClone;
-	}
-
-	/**
-	 * @param VObjectComponent[]|VObjectComponent $val
-	 *
-	 * @return VObjectComponent[]
-	 */
-	public function getCalendarImportComponents(VCalendar $vCalendar, $val): array {
-		$importComponents = [];
-
-		if (is_array($val)) {
-			/** @var VObjectComponent[] $val */
-			foreach ($val as $component) {
-				$cleanComponent = $this->getCleanComponent($component);
-				array_push(
-					$importComponents,
-					$cleanComponent,
-					...$this->getComponentTimezones($vCalendar, $cleanComponent),
-				);
-			}
-		} else {
-			/** @var VObjectComponent $val */
-			$cleanComponent = $this->getCleanComponent($val);
-			array_push(
-				$importComponents,
-				$cleanComponent,
-				...$this->getComponentTimezones($vCalendar, $cleanComponent),
-			);
-		}
-
-		return $importComponents;
-	}
-
-	// TODO Test import and export of various calendars
-	// - https://github.com/nextcloud/calendar/tree/main/tests/assets/ics
-	// - https://github.com/nextcloud/calendar-js/tree/main/tests/assets
-	// - https://github.com/nextcloud/server/tree/master/apps/dav/tests/travis/caldavtest/data/Resource/CalDAV/sharing/calendars/read-write
-
-	/**
-	 * @throws CalendarMigratorException
-	 */
-	public function importCalendar(IUser $user, string $calendarUri, VCalendar $vCalendar): void {
-		$userId = $user->getUID();
-		$principalUri = CalendarMigrator::USERS_URI_ROOT . $userId;
-
-		//  Implementation below based on https://github.com/nextcloud/cdav-library/blob/9b67034837fad9e8f764d0152211d46565bf01f2/src/models/calendarHome.js#L151
-
-		// Create calendar
-		$calendarId = $this->calDavBackend->createCalendar($principalUri, $calendarUri, [
-			'{DAV:}displayname' => $vCalendar->{'X-WR-CALNAME'}->getValue(),
-			'{http://apple.com/ns/ical/}calendar-color' => $vCalendar->{'X-APPLE-CALENDAR-COLOR'}->getValue(),
-			'components' => implode(
-				',',
-				array_reduce(
-					$vCalendar->getComponents(),
-					fn (array $componentNames, VObjectComponent $component) => !in_array($component->name, $componentNames, true) ? [...$componentNames, $component->name] : $componentNames,
-					[],
-				)
-			),
-		]);
-
-		$calendarEvents = array_values(array_filter(
-			$vCalendar->getComponents(),
-			fn ($component) => $component->name !== 'VTIMEZONE',
-		));
-
-		/** @var array<string, VEvent|VEvent[]> $calendarEventMap */
-		$calendarEventMap = [];
-		foreach ($calendarEvents as $vEvent) {
-			$uid = $vEvent->UID->getValue();
-
-			// If uid is a duplicate then this is a recurring event
-			if (isset($calendarEventMap[$uid])) {
-				if (is_array($calendarEventMap[$uid])) {
-					$calendarEventMap[$uid][] = $vEvent;
-				} else {
-					// Set value to an array containing both the existing and new event
-					$calendarEventMap[$uid] = [$calendarEventMap[$uid], $vEvent];
-				}
-			} else {
-				$calendarEventMap[$uid] = $vEvent;
-			}
-		}
-
-		// Add data to the created calendar e.g. VEVENT, VTODO
-		foreach ($calendarEventMap as $uid => $val) {
-			$vCalendarObject = new VCalendar();
-			$vCalendarObject->PRODID = $this->sabreDavServer::$exposeVersion ? '-//SabreDAV//SabreDAV ' . SabreDavVersion::VERSION . '//EN' : '-//SabreDAV//SabreDAV//EN';
-
-			// Implementation used the below as references:
-			// - https://github.com/nextcloud/calendar/blob/1aadc6101ea1dcea578bce1e7c626ddaef911b79/src/store/calendars.js#L1000
-			// - https://github.com/nextcloud/calendar-js/blob/43774b6563502fe31ace6072a75fbe12d2f3cb85/src/parsers/icalendarParser.js#L187
-			// - https://github.com/nextcloud/calendar-js/blob/43774b6563502fe31ace6072a75fbe12d2f3cb85/src/parsers/parserManager.js#L67
-			// - https://github.com/nextcloud/calendar/blob/1aadc6101ea1dcea578bce1e7c626ddaef911b79/src/components/AppNavigation/Settings/SettingsImportSection.vue#L201-L208
-
-			$vCalendarComponents = $this->getCalendarImportComponents($vCalendar, $val);
-
-			foreach ($vCalendarComponents as $component) {
-				$vCalendarObject->add($component);
-			}
-
-			try {
-				$this->calDavBackend->createCalendarObject(
-					$calendarId,
-					UUIDUtil::getUUID() . CalendarMigrator::FILENAME_EXT,
-					$vCalendarObject->serialize(),
-					CalDavBackend::CALENDAR_TYPE_CALENDAR,
-				);
-			} catch (BadRequest $e) {
-				// Rollback creation of calendar on error
-				$this->calDavBackend->deleteCalendar($calendarId, true);
-			}
-		}
 	}
 
 	/**
@@ -422,6 +246,178 @@ class CalendarMigrator {
 	}
 
 	/**
+	 * Return an associative array mapping of Time Zone ID to VTimeZone component
+	 *
+	 * @return array<string, VTimeZone>
+	 */
+	public function getCalendarTimezones(VCalendar $vCalendar) {
+		/** @var VTimeZone[] $calendarTimezones */
+		$calendarTimezones = array_values(array_filter(
+			$vCalendar->getComponents(),
+			fn ($component) => $component->name === 'VTIMEZONE',
+		));
+
+		/** @var array<string, VTimeZone> $calendarTimezoneMap */
+		$calendarTimezoneMap = [];
+		foreach ($calendarTimezones as $vTimeZone) {
+			$calendarTimezoneMap[$vTimeZone->getTimeZone()->getName()] = $vTimeZone;
+		}
+
+		return $calendarTimezoneMap;
+	}
+
+	/**
+	 * @return VTimeZone[]
+	 */
+	public function getTimezonesForComponent(VCalendar $vCalendar, VObjectComponent $component) {
+		$componentTimezoneIds = [];
+
+		foreach ($component->children() as $subComp) {
+			if ($subComp instanceof DateTime && isset($subComp->parameters['TZID'])) {
+				if (!in_array($subComp->parameters['TZID']->getValue(), $componentTimezoneIds, true)) {
+					$componentTimezoneIds[] = $subComp->parameters['TZID']->getValue();
+				}
+			}
+		}
+
+		$calendarTimezoneMap = $this->getCalendarTimezones($vCalendar);
+
+		return array_values(array_filter(array_map(
+			fn (string $timezoneId) => $calendarTimezoneMap[$timezoneId],
+			$componentTimezoneIds,
+		)));
+	}
+
+	public function getCleanComponent(VObjectComponent $component): VObjectComponent {
+		$componentClone = clone $component;
+
+		// Remove RSVP parameters to prevent automatically sending invitaton emails to attendees when importing this component
+		foreach ($componentClone->children() as $subComp) {
+			if (
+				$subComp->name === 'ATTENDEE'
+				&& isset($subComp->parameters['RSVP'])
+			) {
+				unset($subComp->parameters['RSVP']);
+			}
+		}
+
+		return $componentClone;
+	}
+
+	/**
+	 * @return VObjectComponent[]
+	 */
+	public function getComponentsForImport(VCalendar $vCalendar, VObjectComponent $component) {
+		$cleanComponent = $this->getCleanComponent($component);
+		return [
+			...$this->getTimezonesForComponent($vCalendar, $cleanComponent),
+			$cleanComponent,
+		];
+	}
+
+	public function importCalendarObject(int $calendarId, VCalendar $vCalendarObject): void {
+		try {
+			$this->calDavBackend->createCalendarObject(
+				$calendarId,
+				UUIDUtil::getUUID() . CalendarMigrator::FILENAME_EXT,
+				$vCalendarObject->serialize(),
+				CalDavBackend::CALENDAR_TYPE_CALENDAR,
+			);
+		} catch (BadRequest $e) {
+			// Rollback creation of calendar on error
+			$this->calDavBackend->deleteCalendar($calendarId, true);
+		}
+	}
+
+	public function initCalendarObject(): VCalendar {
+		$vCalendarObject = new VCalendar();
+		$vCalendarObject->PRODID = $this->sabreDavServer::$exposeVersion
+			? '-//SabreDAV//SabreDAV ' . SabreDavVersion::VERSION . '//EN'
+			: '-//SabreDAV//SabreDAV//EN';
+		return $vCalendarObject;
+	}
+
+	// TODO Test import and export of various calendars within the scope of migration
+	// - https://github.com/nextcloud/calendar/tree/main/tests/assets/ics
+	// - https://github.com/nextcloud/calendar-js/tree/main/tests/assets
+	// - https://github.com/nextcloud/server/tree/master/apps/dav/tests/travis/caldavtest/data/Resource/CalDAV/sharing/calendars/read-write
+	// - https://github.com/nextcloud/tasks/tree/master/tests/assets/ics/vcalendars
+
+	/**
+	 * @throws CalendarMigratorException
+	 */
+	public function importCalendar(IUser $user, string $filename, string $initialCalendarUri, VCalendar $vCalendar): void {
+		$principalUri = $this->getPrincipalUri($user);
+		$calendarUri = $this->getUniqueCalendarUri($user, $initialCalendarUri);
+
+		//  Implementation below based on https://github.com/nextcloud/cdav-library/blob/9b67034837fad9e8f764d0152211d46565bf01f2/src/models/calendarHome.js#L151
+
+		$calendarId = $this->calDavBackend->createCalendar($principalUri, $calendarUri, [
+			'{DAV:}displayname' => isset($vCalendar->{'X-WR-CALNAME'}) ? $vCalendar->{'X-WR-CALNAME'}->getValue() : $this->l10n->t('Migrated calendar (%1$s)', [$filename]),
+			'{http://apple.com/ns/ical/}calendar-color' => isset($vCalendar->{'X-APPLE-CALENDAR-COLOR'}) ? $vCalendar->{'X-APPLE-CALENDAR-COLOR'}->getValue() : $this->defaults->getColorPrimary(),
+			'components' => implode(
+				',',
+				array_reduce(
+					$vCalendar->getComponents(),
+					fn (array $componentNames, VObjectComponent $component) => !in_array($component->name, $componentNames, true) ? [...$componentNames, $component->name] : $componentNames,
+					[],
+				)
+			),
+		]);
+
+		/** @var VObjectComponent[] $calendarComponents */
+		$calendarComponents = array_values(array_filter(
+			$vCalendar->getComponents(),
+			fn ($component) => $component->name !== 'VTIMEZONE',
+		));
+
+		/** @var array<string, VObjectComponent[]> $groupedCalendarComponents */
+		$groupedCalendarComponents = [];
+		/** @var VObjectComponent[] $ungroupedCalendarComponents */
+		$ungroupedCalendarComponents = [];
+
+		foreach ($calendarComponents as $component) {
+			if (isset($component->UID)) {
+				$uid = $component->UID->getValue();
+				// Components (e.g. VEVENT) with the same UID are recurring
+				if (isset($groupedCalendarComponents[$uid])) {
+					$groupedCalendarComponents[$uid][] = $component;
+				} else {
+					$groupedCalendarComponents[$uid] = [$component];
+				}
+			} else {
+				$ungroupedCalendarComponents[] = $component;
+			}
+		}
+
+		// Implementation used the below as references:
+		// - https://github.com/nextcloud/calendar/blob/1aadc6101ea1dcea578bce1e7c626ddaef911b79/src/store/calendars.js#L1000
+		// - https://github.com/nextcloud/calendar-js/blob/43774b6563502fe31ace6072a75fbe12d2f3cb85/src/parsers/icalendarParser.js#L187
+		// - https://github.com/nextcloud/calendar-js/blob/43774b6563502fe31ace6072a75fbe12d2f3cb85/src/parsers/parserManager.js#L67
+		// - https://github.com/nextcloud/calendar/blob/1aadc6101ea1dcea578bce1e7c626ddaef911b79/src/components/AppNavigation/Settings/SettingsImportSection.vue#L201-L208
+
+		foreach ($groupedCalendarComponents as $uid => $componentGroup) {
+			// Construct and import a calendar object containing all components of a group
+			$vCalendarObject = $this->initCalendarObject();
+			foreach ($componentGroup as $component) {
+				foreach ($this->getComponentsForImport($vCalendar, $component) as $component) {
+					$vCalendarObject->add($component);
+				}
+			}
+			$this->importCalendarObject($calendarId, $vCalendarObject);
+		}
+
+		foreach ($ungroupedCalendarComponents as $component) {
+			// Construct and import a calendar object for a single component
+			$vCalendarObject = $this->initCalendarObject();
+			foreach ($this->getComponentsForImport($vCalendar, $component) as $component) {
+				$vCalendarObject->add($component);
+			}
+			$this->importCalendarObject($calendarId, $vCalendarObject);
+		}
+	}
+
+	/**
 	 * @throws FilesystemException
 	 * @throws CalendarMigratorException
 	 */
@@ -450,13 +446,14 @@ class CalendarMigrator {
 
 			$this->importCalendar(
 				$user,
-				$this->generateCalendarUri($user, $initialCalendarUri),
+				$filename,
+				$initialCalendarUri,
 				$vCalendar,
 				$this->calDavBackend
 			);
 			$vCalendar->destroy();
 
-			$output->writeln("<info>✅ Imported calendar \"$filename\" to account of <$userId></info>");
+			$output->writeln("<info>✅ Imported calendar \"$filename\" into account of <$userId></info>");
 			throw new CalendarMigratorException();
 		}
 
