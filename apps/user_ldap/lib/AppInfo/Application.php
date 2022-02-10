@@ -142,7 +142,7 @@ class Application extends App implements IBootstrap {
 	}
 
 	private function registerFirstLoginListener(IEventDispatcher $dispatcher) {
-		$dispatcher->addServiceListener(PostLoginEvent::class, FirstLoginListener::class);
+		$dispatcher->addServiceListener(/** @var class-string<\OCP\EventDispatcher\Event> */ PostLoginEvent::class, FirstLoginListener::class);
 		\OCP\Util::connectHook(
 			'\OC\User',
 			'assignedUserId',
