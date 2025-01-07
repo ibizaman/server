@@ -101,9 +101,13 @@ class Local extends \OC\Files\Storage\Common {
 		$this->unlinkOnTruncate = $this->config->getSystemValueBool('localstorage.unlink_on_truncate', false);
 
 		if (isset($arguments['isExternal']) && $arguments['isExternal'] && !$this->stat('')) {
-			// data dir not accessible or available, can happen when using an external storage of type Local
-			// on an unmounted system mount point
-			throw new StorageNotAvailableException('Local storage path does not exist "' . $this->getSourcePath('') . '"');
+
+            if (!$this->mkdir('')) {
+                // data dir not accessible or available, can happen when using an external storage of type Local
+                // on an unmounted system mount point
+                throw new StorageNotAvailableException('Local storage path does not exist and could not create it "' . $this->getSourcePath('') . '"');
+            }
+            \OC::$server->get(LoggerInterface::class)->warning('created local storage path ' . $this->getSourcePath(''), ['app' => 'core']);
 		}
 	}
 
